@@ -186,23 +186,29 @@ def generate_ansible_playbook(config):
     {json.dumps(scripts, indent=2)}
     """
 
+    # Chat-style API expects a `messages` array
+    messages = [
+        {"role": "system", "content": "You are a tool for generating Ansible playbooks."},
+        {"role": "user", "content": prompt},
+    ]
+
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
-        "prompt": prompt,
-        "max_tokens": config["context_length"],
         "model": model,
+        "messages": messages,
+        "max_tokens": config["context_length"],
     }
 
     try:
         response = requests.post(llm_endpoint, json=payload, headers=headers)
         if response.status_code == 200:
-            playbook = response.json().get("choices")[0].get("text")
+            playbook = response.json()["choices"][0]["message"]["content"]
             save_path = input("Enter the file path to save the Ansible playbook: ").strip()
             with open(save_path, "w") as file:
                 file.write(playbook)
             print(f"Playbook saved to {save_path}.")
         else:
-            print(f"Error generating playbook: {response.text}")
+            print(f"Error generating playbook: {response.json()}")
     except Exception as e:
         print(f"Error generating playbook: {e}")
 
