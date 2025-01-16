@@ -5,34 +5,39 @@ import difflib
 import argparse
 import requests
 import time
+import pty
+import select
+import signal
 from threading import Thread
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # Globals
-command_log = []
-file_changes = {}
-executed_scripts = {}
+command_log = []         # Stores captured commands
+file_changes = {}        # Tracks file modifications
+executed_scripts = {}    # Captures .sh script content
 observer = None
 config_file = os.path.expanduser("~/.orcai_config.json")
 state_file = os.path.expanduser("~/.orcai_state.json")
-capturing = False
-last_processed_command = 0  # Tracks the last command index in shell history
-history_file = None  # Will be set dynamically
+capturing = False        # Indicates whether we are capturing
+shell_pid = None         # PID of the child shell process used in PTY
 
+##############################################################################
+# Configuration and State
+##############################################################################
 
-def detect_history_file():
-    """Detects the shell history file based on the current shell."""
-    shell = os.getenv("SHELL", "").lower()
-    if "zsh" in shell:
-        return os.path.expanduser("~/.zsh_history")
-    elif "bash" in shell:
-        return os.path.expanduser("~/.bash_history")
-    elif "fish" in shell:
-        return os.path.expanduser("~/.local/share/fish/fish_history")
-    else:
-        raise FileNotFoundError("Unsupported shell or no history file detected.")
+def load_config():
+    """Loads configuration from file."""
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            return json.load(f)
+    return {}
 
+def save_config(config):
+    """Saves configuration to file."""
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to {config_file}")
 
 def configure_orcai():
     """Prompts the user to configure Orcai."""
@@ -50,6 +55,9 @@ def configure_orcai():
     }
     save_config(config)
 
+##############################################################################
+# File Monitoring
+##############################################################################
 
 class FileEditHandler(FileSystemEventHandler):
     """Handles file edits and captures changes."""
@@ -72,7 +80,6 @@ class FileEditHandler(FileSystemEventHandler):
             except Exception as e:
                 print(f"Error processing file {path}: {e}")
 
-
 def start_file_monitoring(directory):
     """Starts monitoring file changes."""
     global observer
@@ -82,7 +89,6 @@ def start_file_monitoring(directory):
         observer.schedule(handler, directory, recursive=True)
         observer.start()
 
-
 def stop_file_monitoring():
     """Stops monitoring file changes."""
     global observer
@@ -91,35 +97,9 @@ def stop_file_monitoring():
         observer.join()
         observer = None
 
-
-def load_config():
-    """Loads configuration from file."""
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def save_config(config):
-    """Saves configuration to file."""
-    with open(config_file, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"Configuration saved to {config_file}")
-
-
-def load_state():
-    """Loads the capture state from the state file."""
-    if os.path.exists(state_file):
-        with open(state_file, "r") as f:
-            return json.load(f)
-    return {"capturing": False}
-
-
-def save_state(state):
-    """Saves the capture state to the state file."""
-    with open(state_file, "w") as f:
-        json.dump(state, f)
-
+##############################################################################
+# Real-Time Shell Capture (PTY)
+##############################################################################
 
 def capture_script(script_path):
     """Reads and captures the content of a script file."""
@@ -132,108 +112,97 @@ def capture_script(script_path):
         except Exception as e:
             print(f"Error reading script {script_path}: {e}")
 
-
 def capture_command(command):
     """Captures executed commands and handles scripts."""
-    command_log.append(command)
+    # Clean up whitespace
+    cmd = command.strip()
+    if cmd:
+        command_log.append(cmd)
+        # Detect script execution
+        if cmd.endswith(".sh") and os.path.exists(cmd):
+            capture_script(cmd)
 
-    # Detect script execution
-    if command.endswith(".sh") and os.path.exists(command):
-        capture_script(command)
+##############################################################################
+# PTY Shell Session
+##############################################################################
 
+def shell_session(config, debug=False):
+    """
+    Spawns a pseudo-terminal with the user's default shell,
+    intercepting commands in real time.
+    """
 
-def monitor_shell_history():
-    """Continuously monitors the shell history file for new commands."""
-    global last_processed_command, capturing, history_file
-    while capturing:
-        try:
-            with open(history_file, "r") as f:
-                lines = f.readlines()
-                new_commands = lines[last_processed_command:]
-                for command in new_commands:
-                    command = command.strip()
-                    capture_command(command)
-                last_processed_command = len(lines)
-        except Exception as e:
-            print(f"Error reading history file: {e}")
-        time.sleep(1)  # Check for new commands every second
-
-
-def start_capture(config, debug=False):
-    """Starts capturing commands and file changes."""
-    state = load_state()
-    if state["capturing"]:
-        print("Capture is already running!")
-        return
-
-    print("Starting capture...")
-    state["capturing"] = True
-    save_state(state)
-
-    global capturing, command_log, file_changes, executed_scripts, last_processed_command, history_file
+    # Mark capturing active
+    global capturing, shell_pid
     capturing = True
-    command_log.clear()
-    file_changes.clear()
-    executed_scripts.clear()
-
-    # Detect history file dynamically
-    try:
-        history_file = detect_history_file()
-        print(f"Using history file: {history_file}")
-    except FileNotFoundError as e:
-        print(e)
-        stop_capture(config)
-        return
-
-    # Initialize history tracking
-    with open(history_file, "r") as f:
-        last_processed_command = len(f.readlines())
-
-    # Start monitoring file changes
     start_file_monitoring(os.path.expanduser("~"))
 
-    # Start monitoring shell history
-    history_thread = Thread(target=monitor_shell_history, daemon=True)
-    history_thread.start()
+    # We'll fork a new process for the user shell via pty
+    pid, fd = pty.fork()
+    shell_pid = pid
 
-    if debug:
-        print("Debug mode enabled. Captured data will be shown on stop.")
+    if pid == 0:
+        # Child process: Replace with user’s preferred shell
+        shell = os.environ.get("SHELL", "/bin/bash")
+        os.execlp(shell, shell)  # Will never return
+    else:
+        # Parent process: read from pty (fd) in real time
+        print("Orcai shell started. Type 'exit' or Ctrl-D to finish and generate the playbook.")
+        try:
+            _pty_loop(fd, config, debug=debug)
+        except OSError:
+            pass
+        finally:
+            # Once the user exits the shell, finalize
+            capturing = False
+            stop_file_monitoring()
+            generate_ansible_playbook(config, debug=debug)
 
+def _pty_loop(fd, config, debug=False):
+    """
+    Main loop for the parent process reading/writing from/to the PTY.
+    Each line typed is captured in real-time.
+    """
+    while True:
+        # Multiplex I/O between user’s TTY (stdin/stdout) and the child pty
+        r, w, e = select.select([fd, sys.stdin], [], [])
 
-def stop_capture(config, debug=False):
-    """Stops capturing and generates an Ansible playbook."""
-    state = load_state()
-    if not state["capturing"]:
-        print("No capture to stop!")
-        return
+        if fd in r:
+            try:
+                output = os.read(fd, 1024)
+                if not output:
+                    break  # Shell has exited
+                sys.stdout.buffer.write(output)
+                sys.stdout.flush()
+            except OSError:
+                break
 
-    print("Stopping capture...")
-    state["capturing"] = False
-    save_state(state)
+        if sys.stdin in r:
+            try:
+                user_input = os.read(sys.stdin.fileno(), 1024)
+                if not user_input:
+                    # Ctrl-D
+                    os.kill(shell_pid, signal.SIGTERM)
+                    break
+                # Convert to string for capturing
+                str_input = user_input.decode(errors="ignore")
+                # Split on newline(s) to capture commands line by line
+                lines = str_input.split("\n")
+                for line in lines:
+                    capture_command(line)
+                os.write(fd, user_input)  # Forward to the shell
+            except OSError:
+                break
 
-    global capturing
-    capturing = False
-    stop_file_monitoring()
-
-    if debug:
-        print("\n=== Captured Commands ===")
-        print(json.dumps(command_log, indent=2))
-
-        print("\n=== Captured File Changes ===")
-        print(json.dumps({path: data["diff"] for path, data in file_changes.items()}, indent=2))
-
-        print("\n=== Captured Executed Scripts ===")
-        print(json.dumps({path: "".join(content) for path, content in executed_scripts.items()}, indent=2))
-
-    # Generate playbook
-    generate_ansible_playbook(config, debug=debug)
-
+##############################################################################
+# Generate Ansible Playbook
+##############################################################################
 
 def generate_ansible_playbook(config, debug=False):
     """Generates an Ansible playbook from captured data."""
-    llm_endpoint = config["api_endpoint"]
-    api_key = config["api_key"]
-    model = config["model"]
+    llm_endpoint = config.get("api_endpoint", "")
+    api_key = config.get("api_key", "")
+    model = config.get("model", "gpt-4")
 
     # Prepare script content as part of the playbook generation
     scripts = {
@@ -268,8 +237,12 @@ def generate_ansible_playbook(config, debug=False):
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": config["context_length"],
+        "max_tokens": config.get("context_length", 2048),
     }
+
+    if not llm_endpoint:
+        print("No LLM endpoint configured. Please run `orcai config` or provide --api-endpoint.")
+        return
 
     try:
         response = requests.post(llm_endpoint, json=payload, headers=headers)
@@ -278,7 +251,7 @@ def generate_ansible_playbook(config, debug=False):
             if debug:
                 print("\n=== LLM Response ===")
                 print(playbook)
-            save_path = input("Enter the file path to save the Ansible playbook: ").strip()
+            save_path = input("\nEnter the file path to save the Ansible playbook: ").strip()
             with open(save_path, "w") as file:
                 file.write(playbook)
             print(f"Playbook saved to {save_path}.")
@@ -287,23 +260,30 @@ def generate_ansible_playbook(config, debug=False):
     except Exception as e:
         print(f"Error generating playbook: {e}")
 
+##############################################################################
+# CLI
+##############################################################################
 
 def cli():
     """Command-line interface for Orcai."""
     parser = argparse.ArgumentParser(prog="orcai", description="Orchestraitor CLI")
     parser.add_argument(
-        "command", choices=["start", "stop", "config"], help="Control the Orchestraitor"
+        "command", 
+        choices=["shell", "config"], 
+        help="Run an interactive shell with real-time capture, or configure the tool."
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode for troubleshooting")
+
     parser.add_argument("--api-endpoint", help="Override API endpoint")
     parser.add_argument("--api-key", help="Override API key")
     parser.add_argument("--model", help="Override LLM model")
     parser.add_argument("--context-length", type=int, help="Override context length")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode for troubleshooting")
 
     args = parser.parse_args()
 
-    # Load configuration and apply command-line overrides
     config = load_config()
+
+    # Apply overrides
     if args.api_endpoint:
         config["api_endpoint"] = args.api_endpoint
     if args.api_key:
@@ -315,10 +295,14 @@ def cli():
 
     if args.command == "config":
         configure_orcai()
-    elif args.command == "start":
-        start_capture(config, debug=args.debug)
-    elif args.command == "stop":
-        stop_capture(config, debug=args.debug)
+    elif args.command == "shell":
+        # Clear old data if any
+        command_log.clear()
+        file_changes.clear()
+        executed_scripts.clear()
+
+        # Start the real-time shell session
+        shell_session(config, debug=args.debug)
 
 
 if __name__ == "__main__":
