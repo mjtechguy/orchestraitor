@@ -34,6 +34,23 @@ def detect_history_file():
         raise FileNotFoundError("Unsupported shell or no history file detected.")
 
 
+def configure_orcai():
+    """Prompts the user to configure Orcai."""
+    print("Configuring Orcai...")
+    api_endpoint = input("Enter the API endpoint (e.g., https://api.openai.com/v1/chat/completions): ").strip()
+    api_key = input("Enter your API key: ").strip()
+    model = input("Enter the model to use (e.g., gpt-4): ").strip()
+    context_length = int(input("Enter the maximum context length (e.g., 2048): ").strip())
+
+    config = {
+        "api_endpoint": api_endpoint,
+        "api_key": api_key,
+        "model": model,
+        "context_length": context_length,
+    }
+    save_config(config)
+
+
 class FileEditHandler(FileSystemEventHandler):
     """Handles file edits and captures changes."""
     def on_modified(self, event):
@@ -142,7 +159,7 @@ def monitor_shell_history():
         time.sleep(1)  # Check for new commands every second
 
 
-def start_capture(config):
+def start_capture(config, debug=False):
     """Starts capturing commands and file changes."""
     state = load_state()
     if state["capturing"]:
@@ -179,8 +196,11 @@ def start_capture(config):
     history_thread = Thread(target=monitor_shell_history, daemon=True)
     history_thread.start()
 
+    if debug:
+        print("Debug mode enabled. Captured data will be shown on stop.")
 
-def stop_capture(config):
+
+def stop_capture(config, debug=False):
     """Stops capturing and generates an Ansible playbook."""
     state = load_state()
     if not state["capturing"]:
@@ -194,10 +214,22 @@ def stop_capture(config):
     global capturing
     capturing = False
     stop_file_monitoring()
-    generate_ansible_playbook(config)
+
+    if debug:
+        print("\n=== Captured Commands ===")
+        print(json.dumps(command_log, indent=2))
+
+        print("\n=== Captured File Changes ===")
+        print(json.dumps({path: data["diff"] for path, data in file_changes.items()}, indent=2))
+
+        print("\n=== Captured Executed Scripts ===")
+        print(json.dumps({path: "".join(content) for path, content in executed_scripts.items()}, indent=2))
+
+    # Generate playbook
+    generate_ansible_playbook(config, debug=debug)
 
 
-def generate_ansible_playbook(config):
+def generate_ansible_playbook(config, debug=False):
     """Generates an Ansible playbook from captured data."""
     llm_endpoint = config["api_endpoint"]
     api_key = config["api_key"]
@@ -222,6 +254,10 @@ def generate_ansible_playbook(config):
     {json.dumps(scripts, indent=2)}
     """
 
+    if debug:
+        print("\n=== LLM Prompt ===")
+        print(prompt)
+
     # Chat-style API expects a `messages` array
     messages = [
         {"role": "system", "content": "You are a tool for generating Ansible playbooks."},
@@ -239,6 +275,9 @@ def generate_ansible_playbook(config):
         response = requests.post(llm_endpoint, json=payload, headers=headers)
         if response.status_code == 200:
             playbook = response.json()["choices"][0]["message"]["content"]
+            if debug:
+                print("\n=== LLM Response ===")
+                print(playbook)
             save_path = input("Enter the file path to save the Ansible playbook: ").strip()
             with open(save_path, "w") as file:
                 file.write(playbook)
@@ -259,6 +298,7 @@ def cli():
     parser.add_argument("--api-key", help="Override API key")
     parser.add_argument("--model", help="Override LLM model")
     parser.add_argument("--context-length", type=int, help="Override context length")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode for troubleshooting")
 
     args = parser.parse_args()
 
@@ -276,9 +316,9 @@ def cli():
     if args.command == "config":
         configure_orcai()
     elif args.command == "start":
-        start_capture(config)
+        start_capture(config, debug=args.debug)
     elif args.command == "stop":
-        stop_capture(config)
+        stop_capture(config, debug=args.debug)
 
 
 if __name__ == "__main__":
