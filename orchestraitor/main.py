@@ -90,7 +90,7 @@ def save_state(state):
 def configure_orcai():
     """Prompts the user to configure Orcai."""
     print("Configuring Orcai...")
-    api_endpoint = input("Enter the API endpoint (e.g., https://api.openai.com/v1/completions): ").strip()
+    api_endpoint = input("Enter the API endpoint (e.g., https://api.openai.com/v1/chat/completions): ").strip()
     api_key = input("Enter your API key: ").strip()
     model = input("Enter the model to use (e.g., gpt-4): ").strip()
     context_length = int(input("Enter the maximum context length (e.g., 2048): ").strip())
