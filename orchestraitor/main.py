@@ -136,31 +136,49 @@ def capture_command(command):
 def shell_session(config, debug=False):
     """
     Spawns a pseudo-terminal with the user's default shell,
-    intercepting commands in real time.
+    intercepting commands in real-time and dynamically configuring history settings.
     """
-
-    # Mark capturing active
     global capturing, shell_pid
     capturing = True
     start_file_monitoring(os.path.expanduser("~"))
 
-    # We'll fork a new process for the user shell via pty
+    # Fork a new pseudo-terminal process
     pid, fd = pty.fork()
     shell_pid = pid
 
     if pid == 0:
-        # Child process: Replace with user’s preferred shell
+        # Child process: Start user's default shell
         shell = os.environ.get("SHELL", "/bin/bash")
-        os.execlp(shell, shell)  # Will never return
+        
+        # Apply dynamic history configuration
+        if "zsh" in shell:
+            os.environ["HISTFILE"] = os.path.expanduser("~/.zsh_history")
+            os.environ["HISTSIZE"] = "10000"
+            os.environ["SAVEHIST"] = "10000"
+            os.environ["ZDOTDIR"] = os.path.expanduser("~")  # Use home directory for history
+            zshrc_path = os.path.expanduser("~/.zshrc")
+            if os.path.exists(zshrc_path):
+                with open(zshrc_path, "a") as zshrc:
+                    zshrc.write("\nsetopt INC_APPEND_HISTORY\nsetopt SHARE_HISTORY\n")
+        elif "bash" in shell:
+            os.environ["HISTFILE"] = os.path.expanduser("~/.bash_history")
+            os.environ["HISTSIZE"] = "10000"
+            os.environ["HISTCONTROL"] = "ignoredups:erasedups"
+            os.environ["PROMPT_COMMAND"] = "history -a; history -n"  # Save and load history
+        elif "fish" in shell:
+            os.environ["fish_history"] = os.path.expanduser("~/.local/share/fish/fish_history")
+            # Fish generally handles history automatically, but we ensure it's correctly configured
+
+        # Launch the shell
+        os.execlp(shell, shell)  # Replace child process with the shell
     else:
-        # Parent process: read from pty (fd) in real time
+        # Parent process: Manage I/O with PTY
         print("Orcai shell started. Type 'exit' or Ctrl-D to finish and generate the playbook.")
         try:
             _pty_loop(fd, config, debug=debug)
         except OSError:
             pass
         finally:
-            # Once the user exits the shell, finalize
             capturing = False
             stop_file_monitoring()
             generate_ansible_playbook(config, debug=debug)
@@ -258,9 +276,19 @@ def generate_ansible_playbook(config, debug=False):
             if debug:
                 print("\n=== LLM Response ===")
                 print(playbook)
+
+            # Extract YAML content
+            yaml_start = playbook.find("---")
+            if yaml_start != -1:
+                valid_yaml = playbook[yaml_start:]
+            else:
+                print("Error: No valid YAML content found in the LLM response.")
+                return
+
+            # Save the extracted YAML content
             save_path = input("\nEnter the file path to save the Ansible playbook: ").strip()
             with open(save_path, "w") as file:
-                file.write(playbook)
+                file.write(valid_yaml)
             print(f"Playbook saved to {save_path}.")
         else:
             print(f"Error generating playbook: {response.json()}")
