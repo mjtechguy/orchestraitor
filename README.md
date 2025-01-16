@@ -19,7 +19,7 @@
 ### Prerequisites
 
 - Python 3.8 or higher
-- `pip` for package installation
+- `pip` or `pipx` for package installation
 - Root access to set up the `systemd` service
 
 ### Steps

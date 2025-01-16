@@ -13,6 +13,7 @@ file_changes = {}
 executed_scripts = {}
 observer = None
 config_file = os.path.expanduser("~/.orcai_config.json")
+state_file = os.path.expanduser("~/.orcai_state.json")
 capturing = False
 
 
@@ -72,6 +73,20 @@ def save_config(config):
     print(f"Configuration saved to {config_file}")
 
 
+def load_state():
+    """Loads the capture state from the state file."""
+    if os.path.exists(state_file):
+        with open(state_file, "r") as f:
+            return json.load(f)
+    return {"capturing": False}
+
+
+def save_state(state):
+    """Saves the capture state to the state file."""
+    with open(state_file, "w") as f:
+        json.dump(state, f)
+
+
 def configure_orcai():
     """Prompts the user to configure Orcai."""
     print("Configuring Orcai...")
@@ -112,37 +127,35 @@ def capture_command(command):
 
 def start_capture(config):
     """Starts capturing commands and file changes."""
-    global capturing, command_log, file_changes, executed_scripts
-    if capturing:
+    state = load_state()
+    if state["capturing"]:
         print("Capture is already running!")
         return
+
     print("Starting capture...")
+    state["capturing"] = True
+    save_state(state)
+
+    global capturing, command_log, file_changes, executed_scripts
     capturing = True
     command_log.clear()
     file_changes.clear()
     executed_scripts.clear()
     start_file_monitoring(os.path.expanduser("~"))
 
-    # Simulate capturing commands
-    def mock_command_execution():
-        test_commands = [
-            "mkdir test_directory",
-            "echo 'Hello, world!' > test_directory/example.txt",
-            "./test_script.sh",  # Simulate script execution
-        ]
-        for cmd in test_commands:
-            capture_command(cmd)
-
-    mock_command_execution()
-
 
 def stop_capture(config):
     """Stops capturing and generates an Ansible playbook."""
-    global capturing
-    if not capturing:
+    state = load_state()
+    if not state["capturing"]:
         print("No capture to stop!")
         return
+
     print("Stopping capture...")
+    state["capturing"] = False
+    save_state(state)
+
+    global capturing
     capturing = False
     stop_file_monitoring()
     generate_ansible_playbook(config)
