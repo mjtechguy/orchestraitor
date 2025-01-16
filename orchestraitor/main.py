@@ -18,7 +18,20 @@ config_file = os.path.expanduser("~/.orcai_config.json")
 state_file = os.path.expanduser("~/.orcai_state.json")
 capturing = False
 last_processed_command = 0  # Tracks the last command index in shell history
-history_file = os.path.expanduser("~/.bash_history")  # Default shell history file
+history_file = None  # Will be set dynamically
+
+
+def detect_history_file():
+    """Detects the shell history file based on the current shell."""
+    shell = os.getenv("SHELL", "").lower()
+    if "zsh" in shell:
+        return os.path.expanduser("~/.zsh_history")
+    elif "bash" in shell:
+        return os.path.expanduser("~/.bash_history")
+    elif "fish" in shell:
+        return os.path.expanduser("~/.local/share/fish/fish_history")
+    else:
+        raise FileNotFoundError("Unsupported shell or no history file detected.")
 
 
 class FileEditHandler(FileSystemEventHandler):
@@ -91,23 +104,6 @@ def save_state(state):
         json.dump(state, f)
 
 
-def configure_orcai():
-    """Prompts the user to configure Orcai."""
-    print("Configuring Orcai...")
-    api_endpoint = input("Enter the API endpoint (e.g., https://api.openai.com/v1/chat/completions): ").strip()
-    api_key = input("Enter your API key: ").strip()
-    model = input("Enter the model to use (e.g., gpt-4): ").strip()
-    context_length = int(input("Enter the maximum context length (e.g., 2048): ").strip())
-
-    config = {
-        "api_endpoint": api_endpoint,
-        "api_key": api_key,
-        "model": model,
-        "context_length": context_length,
-    }
-    save_config(config)
-
-
 def capture_script(script_path):
     """Reads and captures the content of a script file."""
     if os.path.exists(script_path):
@@ -131,7 +127,7 @@ def capture_command(command):
 
 def monitor_shell_history():
     """Continuously monitors the shell history file for new commands."""
-    global last_processed_command, capturing
+    global last_processed_command, capturing, history_file
     while capturing:
         try:
             with open(history_file, "r") as f:
@@ -157,11 +153,20 @@ def start_capture(config):
     state["capturing"] = True
     save_state(state)
 
-    global capturing, command_log, file_changes, executed_scripts, last_processed_command
+    global capturing, command_log, file_changes, executed_scripts, last_processed_command, history_file
     capturing = True
     command_log.clear()
     file_changes.clear()
     executed_scripts.clear()
+
+    # Detect history file dynamically
+    try:
+        history_file = detect_history_file()
+        print(f"Using history file: {history_file}")
+    except FileNotFoundError as e:
+        print(e)
+        stop_capture(config)
+        return
 
     # Initialize history tracking
     with open(history_file, "r") as f:
