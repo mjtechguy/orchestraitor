@@ -4,6 +4,8 @@ import json
 import difflib
 import argparse
 import requests
+import time
+from threading import Thread
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -15,6 +17,8 @@ observer = None
 config_file = os.path.expanduser("~/.orcai_config.json")
 state_file = os.path.expanduser("~/.orcai_state.json")
 capturing = False
+last_processed_command = 0  # Tracks the last command index in shell history
+history_file = os.path.expanduser("~/.bash_history")  # Default shell history file
 
 
 class FileEditHandler(FileSystemEventHandler):
@@ -125,6 +129,23 @@ def capture_command(command):
         capture_script(command)
 
 
+def monitor_shell_history():
+    """Continuously monitors the shell history file for new commands."""
+    global last_processed_command, capturing
+    while capturing:
+        try:
+            with open(history_file, "r") as f:
+                lines = f.readlines()
+                new_commands = lines[last_processed_command:]
+                for command in new_commands:
+                    command = command.strip()
+                    capture_command(command)
+                last_processed_command = len(lines)
+        except Exception as e:
+            print(f"Error reading history file: {e}")
+        time.sleep(1)  # Check for new commands every second
+
+
 def start_capture(config):
     """Starts capturing commands and file changes."""
     state = load_state()
@@ -136,12 +157,22 @@ def start_capture(config):
     state["capturing"] = True
     save_state(state)
 
-    global capturing, command_log, file_changes, executed_scripts
+    global capturing, command_log, file_changes, executed_scripts, last_processed_command
     capturing = True
     command_log.clear()
     file_changes.clear()
     executed_scripts.clear()
+
+    # Initialize history tracking
+    with open(history_file, "r") as f:
+        last_processed_command = len(f.readlines())
+
+    # Start monitoring file changes
     start_file_monitoring(os.path.expanduser("~"))
+
+    # Start monitoring shell history
+    history_thread = Thread(target=monitor_shell_history, daemon=True)
+    history_thread.start()
 
 
 def stop_capture(config):
