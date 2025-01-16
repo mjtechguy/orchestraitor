@@ -312,31 +312,5 @@ def cli():
         shell_session(config, debug=args.debug)
 
 
-if __name__ == "__main__":class FileEditHandler(FileSystemEventHandler):
-    """Handles file edits and captures changes."""
-    def on_modified(self, event):
-        # Skip if this is a directory event
-        if event.is_directory:
-            return
-
-        if capturing:
-            path = event.src_path
-            try:
-                with open(path, "r") as f:
-                    new_content = f.readlines()
-
-                # Compare with previously saved content
-                if path in file_changes:
-                    old_content = file_changes[path]["content"]
-                    diff = difflib.unified_diff(
-                        old_content,
-                        new_content,
-                        fromfile="before",
-                        tofile="after"
-                    )
-                    file_changes[path]["diff"] = "\n".join(diff)
-                else:
-                    file_changes[path] = {"content": new_content, "diff": None}
-            except Exception as e:
-                print(f"Error processing file {path}: {e}")
+if __name__ == "__main__":
     cli()
