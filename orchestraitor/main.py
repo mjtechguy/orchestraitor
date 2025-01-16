@@ -62,8 +62,8 @@ def configure_orcai():
 class FileEditHandler(FileSystemEventHandler):
     """Handles file edits and captures changes."""
     def on_modified(self, event):
-        # Skip if this is a directory event
-        if event.is_directory:
+        # Skip directories and temporary files
+        if event.is_directory or event.src_path.endswith(".new"):
             return
 
         if capturing:
@@ -120,14 +120,16 @@ def capture_script(script_path):
             print(f"Error reading script {script_path}: {e}")
 
 def capture_command(command):
-    """Captures executed commands and handles scripts."""
-    # Clean up whitespace
+    """Captures executed commands and filters out non-user commands."""
     cmd = command.strip()
-    if cmd:
-        command_log.append(cmd)
-        # Detect script execution
-        if cmd.endswith(".sh") and os.path.exists(cmd):
-            capture_script(cmd)
+    if not cmd or "orcai" in cmd:  # Ignore empty commands or Orcai-related commands
+        return
+
+    command_log.append(cmd)
+
+    # Detect script execution
+    if cmd.endswith(".sh") and os.path.exists(cmd):
+        capture_script(cmd)
 
 ##############################################################################
 # PTY Shell Session
@@ -155,21 +157,15 @@ def shell_session(config, debug=False):
             os.environ["HISTFILE"] = os.path.expanduser("~/.zsh_history")
             os.environ["HISTSIZE"] = "10000"
             os.environ["SAVEHIST"] = "10000"
-            os.environ["ZDOTDIR"] = os.path.expanduser("~")  # Use home directory for history
-            zshrc_path = os.path.expanduser("~/.zshrc")
-            if os.path.exists(zshrc_path):
-                with open(zshrc_path, "a") as zshrc:
-                    zshrc.write("\nsetopt INC_APPEND_HISTORY\nsetopt SHARE_HISTORY\n")
+            os.environ["ZDOTDIR"] = os.path.expanduser("~")
         elif "bash" in shell:
             os.environ["HISTFILE"] = os.path.expanduser("~/.bash_history")
             os.environ["HISTSIZE"] = "10000"
             os.environ["HISTCONTROL"] = "ignoredups:erasedups"
-            os.environ["PROMPT_COMMAND"] = "history -a; history -n"  # Save and load history
+            os.environ["PROMPT_COMMAND"] = "history -a; history -n"
         elif "fish" in shell:
             os.environ["fish_history"] = os.path.expanduser("~/.local/share/fish/fish_history")
-            # Fish generally handles history automatically, but we ensure it's correctly configured
 
-        # Launch the shell
         os.execlp(shell, shell)  # Replace child process with the shell
     else:
         # Parent process: Manage I/O with PTY
@@ -184,40 +180,29 @@ def shell_session(config, debug=False):
             generate_ansible_playbook(config, debug=debug)
 
 def _pty_loop(fd, config, debug=False):
-    """
-    Main loop for the parent process reading/writing from/to the PTY.
-    Each line typed is captured in real-time.
-    """
-    while True:
-        # Multiplex I/O between user’s TTY (stdin/stdout) and the child pty
-        r, w, e = select.select([fd, sys.stdin], [], [])
-
-        if fd in r:
-            try:
+    """Main loop for managing I/O with the PTY."""
+    try:
+        while True:
+            r, w, e = select.select([fd, sys.stdin], [], [])
+            if fd in r:
                 output = os.read(fd, 1024)
                 if not output:
-                    break  # Shell has exited
+                    break
                 sys.stdout.buffer.write(output)
                 sys.stdout.flush()
-            except OSError:
-                break
 
-        if sys.stdin in r:
-            try:
+            if sys.stdin in r:
                 user_input = os.read(sys.stdin.fileno(), 1024)
                 if not user_input:
-                    # Ctrl-D
                     os.kill(shell_pid, signal.SIGTERM)
                     break
-                # Convert to string for capturing
-                str_input = user_input.decode(errors="ignore")
-                # Split on newline(s) to capture commands line by line
-                lines = str_input.split("\n")
+                lines = user_input.decode(errors="ignore").split("\n")
                 for line in lines:
                     capture_command(line)
-                os.write(fd, user_input)  # Forward to the shell
-            except OSError:
-                break
+                os.write(fd, user_input)
+    except KeyboardInterrupt:
+        print("\nExiting shell on KeyboardInterrupt...")
+        os.kill(shell_pid, signal.SIGTERM)
 
 ##############################################################################
 # Generate Ansible Playbook
@@ -229,14 +214,10 @@ def generate_ansible_playbook(config, debug=False):
     api_key = config.get("api_key", "")
     model = config.get("model", "gpt-4")
 
-    # Prepare script content as part of the playbook generation
-    scripts = {
-        path: "".join(content) for path, content in executed_scripts.items()
-    }
-
     # Prepare data for the LLM
     prompt = f"""
     Convert the following shell commands, file changes, and executed scripts into an Ansible playbook:
+    Only output the YAML content for the playbook without any additional text, explanations, or formatting.
 
     Commands:
     {json.dumps(command_log, indent=2)}
@@ -245,14 +226,13 @@ def generate_ansible_playbook(config, debug=False):
     {json.dumps({path: data["diff"] for path, data in file_changes.items()}, indent=2)}
 
     Executed Scripts:
-    {json.dumps(scripts, indent=2)}
+    {json.dumps(executed_scripts, indent=2)}
     """
 
     if debug:
         print("\n=== LLM Prompt ===")
         print(prompt)
 
-    # Chat-style API expects a `messages` array
     messages = [
         {"role": "system", "content": "You are a tool for generating Ansible playbooks."},
         {"role": "user", "content": prompt},
@@ -265,10 +245,6 @@ def generate_ansible_playbook(config, debug=False):
         "max_tokens": config.get("context_length", 2048),
     }
 
-    if not llm_endpoint:
-        print("No LLM endpoint configured. Please run `orcai config` or provide --api-endpoint.")
-        return
-
     try:
         response = requests.post(llm_endpoint, json=payload, headers=headers)
         if response.status_code == 200:
@@ -277,18 +253,9 @@ def generate_ansible_playbook(config, debug=False):
                 print("\n=== LLM Response ===")
                 print(playbook)
 
-            # Extract YAML content
-            yaml_start = playbook.find("---")
-            if yaml_start != -1:
-                valid_yaml = playbook[yaml_start:]
-            else:
-                print("Error: No valid YAML content found in the LLM response.")
-                return
-
-            # Save the extracted YAML content
             save_path = input("\nEnter the file path to save the Ansible playbook: ").strip()
             with open(save_path, "w") as file:
-                file.write(valid_yaml)
+                file.write(playbook.strip())
             print(f"Playbook saved to {save_path}.")
         else:
             print(f"Error generating playbook: {response.json()}")
@@ -331,12 +298,9 @@ def cli():
     if args.command == "config":
         configure_orcai()
     elif args.command == "shell":
-        # Clear old data if any
         command_log.clear()
         file_changes.clear()
         executed_scripts.clear()
-
-        # Start the real-time shell session
         shell_session(config, debug=args.debug)
 
 
