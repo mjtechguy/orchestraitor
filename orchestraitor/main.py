@@ -1,0 +1,230 @@
+import os
+import sys
+import json
+import difflib
+import argparse
+import requests
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Globals
+command_log = []
+file_changes = {}
+executed_scripts = {}
+observer = None
+config_file = os.path.expanduser("~/.orcai_config.json")
+capturing = False
+
+
+class FileEditHandler(FileSystemEventHandler):
+    """Handles file edits and captures changes."""
+    def on_modified(self, event):
+        if event.is_file() and capturing:
+            path = event.src_path
+            try:
+                with open(path, "r") as f:
+                    new_content = f.readlines()
+
+                # Compare with previously saved content
+                if path in file_changes:
+                    old_content = file_changes[path]["content"]
+                    diff = difflib.unified_diff(
+                        old_content, new_content, fromfile="before", tofile="after"
+                    )
+                    file_changes[path]["diff"] = "\n".join(diff)
+                else:
+                    file_changes[path] = {"content": new_content, "diff": None}
+            except Exception as e:
+                print(f"Error processing file {path}: {e}")
+
+
+def start_file_monitoring(directory):
+    """Starts monitoring file changes."""
+    global observer
+    if observer is None:
+        observer = Observer()
+        handler = FileEditHandler()
+        observer.schedule(handler, directory, recursive=True)
+        observer.start()
+
+
+def stop_file_monitoring():
+    """Stops monitoring file changes."""
+    global observer
+    if observer:
+        observer.stop()
+        observer.join()
+        observer = None
+
+
+def load_config():
+    """Loads configuration from file."""
+    if os.path.exists(config_file):
+        with open(config_file, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(config):
+    """Saves configuration to file."""
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to {config_file}")
+
+
+def configure_orcai():
+    """Prompts the user to configure Orcai."""
+    print("Configuring Orcai...")
+    api_endpoint = input("Enter the API endpoint (e.g., https://api.openai.com/v1/completions): ").strip()
+    api_key = input("Enter your API key: ").strip()
+    model = input("Enter the model to use (e.g., gpt-4): ").strip()
+    context_length = int(input("Enter the maximum context length (e.g., 2048): ").strip())
+
+    config = {
+        "api_endpoint": api_endpoint,
+        "api_key": api_key,
+        "model": model,
+        "context_length": context_length,
+    }
+    save_config(config)
+
+
+def capture_script(script_path):
+    """Reads and captures the content of a script file."""
+    if os.path.exists(script_path):
+        try:
+            with open(script_path, "r") as script_file:
+                content = script_file.readlines()
+                executed_scripts[script_path] = content
+                print(f"Captured script: {script_path}")
+        except Exception as e:
+            print(f"Error reading script {script_path}: {e}")
+
+
+def capture_command(command):
+    """Captures executed commands and handles scripts."""
+    command_log.append(command)
+
+    # Detect script execution
+    if command.endswith(".sh") and os.path.exists(command):
+        capture_script(command)
+
+
+def start_capture(config):
+    """Starts capturing commands and file changes."""
+    global capturing, command_log, file_changes, executed_scripts
+    if capturing:
+        print("Capture is already running!")
+        return
+    print("Starting capture...")
+    capturing = True
+    command_log.clear()
+    file_changes.clear()
+    executed_scripts.clear()
+    start_file_monitoring(os.path.expanduser("~"))
+
+    # Simulate capturing commands
+    def mock_command_execution():
+        test_commands = [
+            "mkdir test_directory",
+            "echo 'Hello, world!' > test_directory/example.txt",
+            "./test_script.sh",  # Simulate script execution
+        ]
+        for cmd in test_commands:
+            capture_command(cmd)
+
+    mock_command_execution()
+
+
+def stop_capture(config):
+    """Stops capturing and generates an Ansible playbook."""
+    global capturing
+    if not capturing:
+        print("No capture to stop!")
+        return
+    print("Stopping capture...")
+    capturing = False
+    stop_file_monitoring()
+    generate_ansible_playbook(config)
+
+
+def generate_ansible_playbook(config):
+    """Generates an Ansible playbook from captured data."""
+    llm_endpoint = config["api_endpoint"]
+    api_key = config["api_key"]
+    model = config["model"]
+
+    # Prepare script content as part of the playbook generation
+    scripts = {
+        path: "".join(content) for path, content in executed_scripts.items()
+    }
+
+    # Prepare data for the LLM
+    prompt = f"""
+    Convert the following shell commands, file changes, and executed scripts into an Ansible playbook:
+
+    Commands:
+    {json.dumps(command_log, indent=2)}
+
+    File Changes:
+    {json.dumps({path: data["diff"] for path, data in file_changes.items()}, indent=2)}
+
+    Executed Scripts:
+    {json.dumps(scripts, indent=2)}
+    """
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "prompt": prompt,
+        "max_tokens": config["context_length"],
+        "model": model,
+    }
+
+    try:
+        response = requests.post(llm_endpoint, json=payload, headers=headers)
+        if response.status_code == 200:
+            playbook = response.json().get("choices")[0].get("text")
+            save_path = input("Enter the file path to save the Ansible playbook: ").strip()
+            with open(save_path, "w") as file:
+                file.write(playbook)
+            print(f"Playbook saved to {save_path}.")
+        else:
+            print(f"Error generating playbook: {response.text}")
+    except Exception as e:
+        print(f"Error generating playbook: {e}")
+
+
+def cli():
+    """Command-line interface for Orcai."""
+    parser = argparse.ArgumentParser(prog="orcai", description="Orchestraitor CLI")
+    parser.add_argument(
+        "command", choices=["start", "stop", "config"], help="Control the Orchestraitor"
+    )
+    parser.add_argument("--api-endpoint", help="Override API endpoint")
+    parser.add_argument("--api-key", help="Override API key")
+    parser.add_argument("--model", help="Override LLM model")
+    parser.add_argument("--context-length", type=int, help="Override context length")
+
+    args = parser.parse_args()
+
+    # Load configuration and apply command-line overrides
+    config = load_config()
+    if args.api_endpoint:
+        config["api_endpoint"] = args.api_endpoint
+    if args.api_key:
+        config["api_key"] = args.api_key
+    if args.model:
+        config["model"] = args.model
+    if args.context_length:
+        config["context_length"] = args.context_length
+
+    if args.command == "config":
+        configure_orcai()
+    elif args.command == "start":
+        start_capture(config)
+    elif args.command == "stop":
+        stop_capture(config)
+
+
+if __name__ == "__main__":
+    cli()
